@@ -1,0 +1,57 @@
+name: Verify Mac signing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Scripts/macos-sign.py
+      - Scripts/macos-sign.test.py
+      - Scripts/bundle.sh
+      - VERSION
+      - .github/workflows/macos-signing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Only this repository holds the pinned certificate secrets; forks skip the job.
+    if: github.repository == 'e-kotov/JumpCut'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v4.2.2 — pinned by full commit SHA, as in ci.yml.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check Keychain access and signature verification
+        env:
+          FORK_MACOS_APPLE_CERTIFICATE_BASE64: ${{ secrets.FORK_MACOS_APPLE_CERTIFICATE_BASE64 }}
+          FORK_MACOS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.FORK_MACOS_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$FORK_MACOS_APPLE_CERTIFICATE_BASE64" && test -n "$FORK_MACOS_APPLE_CERTIFICATE_PASSWORD"
+          python3 Scripts/macos-sign.test.py
+
+      - name: Build, sign and verify the real app bundle
+        env:
+          FORK_MACOS_APPLE_CERTIFICATE_BASE64: ${{ secrets.FORK_MACOS_APPLE_CERTIFICATE_BASE64 }}
+          FORK_MACOS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.FORK_MACOS_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./Scripts/bundle.sh
+          python3 Scripts/macos-sign.py
+          codesign --verify --deep --strict --verbose=2 build/JumpCut.app
+          # macos-sign.py already verified the pinned requirement, identifier, version
+          # and signer fingerprint; nothing else is printed to the public log.
+
+      # actions/upload-artifact v7.0.1 — pinned by full commit SHA.
+      # Smoke artifact only: this workflow never publishes or attaches releases.
+      - name: Upload signed bundle as smoke artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mac-signing-smoke
+          path: build/JumpCut.app
+          retention-days: 3
+          if-no-files-found: error

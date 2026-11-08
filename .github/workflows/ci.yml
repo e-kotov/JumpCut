@@ -1,0 +1,37 @@
+name: JumpCut CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      # actions/checkout v4.2.2 — pinned by full commit SHA.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Build (strict concurrency, warnings as errors)
+        run: swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+
+      - name: Test gesture payload serialization (no input events posted)
+        run: bash Tests/run.sh
+
+      - name: Test Space boundaries and gesture completion
+        run: swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+
+      - name: Test hotkey settings across processes (no shortcuts captured)
+        run: bash Tests/hotkeys.sh
+
+      - name: Bundle JumpCut.app (ad-hoc signed in CI)
+        run: ./Scripts/bundle.sh
+
+      - name: Verify bundle assembles and ad-hoc signs
+        run: codesign --verify --verbose=2 build/JumpCut.app
