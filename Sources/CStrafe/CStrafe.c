@@ -56,26 +56,43 @@ typedef CF_ENUM(uint16_t, CGGestureMotion) {
 typedef int32_t  CGSConnectionID;
 typedef uint64_t CGSSpaceID;
 extern CFArrayRef  CGSCopyManagedDisplaySpaces(CGSConnectionID connection, CFStringRef display) __attribute__((weak_import));
-extern CFStringRef CGSCopyActiveMenuBarDisplayIdentifier(CGSConnectionID connection) __attribute__((weak_import));
 extern CGSConnectionID CGSMainConnectionID(void) __attribute__((weak_import));
-extern CGSSpaceID  CGSGetActiveSpace(CGSConnectionID connection) __attribute__((weak_import));
 
 bool strafe_cgs_available(void) {
     return (&CGSMainConnectionID != NULL) &&
-           (&CGSGetActiveSpace != NULL) &&
            (&CGSCopyManagedDisplaySpaces != NULL);
 }
 
 // --- Synthesis (SPEC §1.5) ------------------------------------------------
+#include <math.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#ifdef JUMPCUT_PREPARATION_TESTING
+#include "PreparationTestHooks.h"
+#define calloc strafe_test_calloc
+#define free strafe_test_free
+#define CGEventCreate strafe_test_event_create
+#define CGEventSetIntegerValueField strafe_test_set_integer
+#define CFRelease strafe_test_release
+#define usleep strafe_test_usleep
+#endif
+
 bool strafe_uses_iohid_payload(void) {
+#ifdef JUMPCUT_PREPARATION_TESTING
+    return strafe_test_uses_iohid_payload();
+#else
     if (__builtin_available(macOS 27.0, *)) { return true; }
     return false;
+#endif
 }
 
-// Whether "Natural scrolling" is on (System Settings > Trackpad > Scroll &
-// Zoom). An absent key means the macOS default, which is on. Read at post time,
-// not cached, so toggling the setting takes effect without relaunching.
+// Sample once per preparation, so changing the preference cannot reverse a
+// gesture halfway through. An absent preference means macOS's default (on).
 static bool natural_scrolling_enabled(void) {
+#ifdef JUMPCUT_PREPARATION_TESTING
+    return strafe_test_natural_scrolling_enabled();
+#else
     CFPropertyListRef value = CFPreferencesCopyAppValue(
         CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication);
     if (!value) { return true; }
@@ -89,27 +106,58 @@ static bool natural_scrolling_enabled(void) {
     }
     CFRelease(value);
     return enabled;
+#endif
 }
 
-// MEASURED on macOS 27.0 (26A428), one display: the Dock reads a POSTED
-// gesture's direction in the Natural-scrolling orientation, so the posted sign
-// must be reversed only when Natural scrolling is on. An INCOMING real gesture's
-// sign does not depend on the setting (see strafe_event_moves_right). Coupling
-// both to one macOS 27 flag reversed swipes with Natural scrolling on and
-// inverted the first/last-Space guard with it off (issue #10).
+// Inherited macOS 27 convention: outgoing events compensate for Natural
+// Scrolling; incoming physical gesture signs are handled independently.
 bool strafe_posted_sign_reversed(void) {
     return strafe_uses_iohid_payload() && natural_scrolling_enabled();
 }
 
-// One phase of a horizontal dock swipe, with progress and velocity supplied by
-// the caller. Every field the WindowServer reads is set here; the two callers
-// below differ only in the numbers they hand it.
-static bool post_dock_swipe_shaped(CGSGesturePhase phase, double progress, double velocity) {
-    const bool augmented = strafe_uses_iohid_payload();
-    // Keep the caller-facing sign stable: positive means the Space on the right.
-    if (strafe_posted_sign_reversed()) { progress = -progress; velocity = -velocity; }
-    CGEventRef ev = CGEventCreate(NULL);
-    if (!ev) { return false; }
+typedef struct {
+    CGEventRef dock;
+    CGEventRef companion;
+    uint32_t delayAfterMicroseconds;
+} PreparedPhase;
+
+struct StrafePreparedGesture {
+    uint32_t phaseCount;
+    PreparedPhase phases[];
+};
+
+static void free_phase(PreparedPhase *phase) {
+    if (phase->dock) { CFRelease(phase->dock); }
+    if (phase->companion) { CFRelease(phase->companion); }
+}
+
+void strafe_free_prepared_gesture(StrafePreparedGesture *gesture) {
+    if (!gesture) { return; }
+    for (uint32_t i = 0; i < gesture->phaseCount; i++) {
+        free_phase(&gesture->phases[i]);
+    }
+    free(gesture);
+}
+
+static StrafePreparedGesture *allocate_gesture(size_t phaseCount) {
+    if (phaseCount > UINT32_MAX
+        || phaseCount > (SIZE_MAX - sizeof(StrafePreparedGesture)) / sizeof(PreparedPhase)) {
+        return NULL;
+    }
+    size_t size = sizeof(StrafePreparedGesture) + phaseCount * sizeof(PreparedPhase);
+    StrafePreparedGesture *gesture = calloc(1, size);
+    if (gesture) { gesture->phaseCount = (uint32_t)phaseCount; }
+    return gesture;
+}
+
+// On failure, the caller frees the entire zero-initialized gesture. Ownership
+// stays in `out` even if augmentation or companion creation fails late.
+static bool prepare_phase(PreparedPhase *out, CGSGesturePhase phase,
+                          double progress, double velocity, bool augmented, bool reversed) {
+    if (reversed) { progress = -progress; velocity = -velocity; }
+    out->dock = CGEventCreate(NULL);
+    if (!out->dock) { return false; }
+    CGEventRef ev = out->dock;
     CGEventSetIntegerValueField(ev, kCGSEventTypeField,            kCGSEventDockControl);
     CGEventSetIntegerValueField(ev, kCGEventGestureHIDType,        kIOHIDEventTypeDockSwipe);
     CGEventSetIntegerValueField(ev, kCGEventGesturePhase,          phase);
@@ -117,67 +165,127 @@ static bool post_dock_swipe_shaped(CGSGesturePhase phase, double progress, doubl
     CGEventSetIntegerValueField(ev, kCGEventGestureSwipeMotion,    kCGGestureMotionHorizontal);
     CGEventSetDoubleValueField (ev, kCGEventGestureSwipeVelocityX, velocity);
     CGEventSetDoubleValueField (ev, kCGEventGestureSwipeVelocityY, augmented ? 0 : velocity);
-    CGEventRef companion = NULL;
     if (augmented) {
         CGEventSetIntegerValueField(ev, kCGEventGesturePhaseAlias, phase);
         CGEventSetDoubleValueField(ev, kCGEventGestureZoomDeltaY, 3.0);
         CGEventSetDoubleValueField(ev, kCGEventGestureSwipePositionX, 0.1);
-        CGEventRef replacement = strafe_create_augmented_event(ev);
+        out->dock = strafe_create_augmented_event(ev);
         CFRelease(ev);
-        if (!replacement) { return false; }
-        ev = replacement;
-        companion = CGEventCreate(NULL);
-        if (!companion) { CFRelease(ev); return false; }
-        CGEventSetIntegerValueField(companion, kCGSEventTypeField, kCGSEventGesture);
+        if (!out->dock) { return false; }
+        out->companion = CGEventCreate(NULL);
+        if (!out->companion) { return false; }
+        CGEventSetIntegerValueField(out->companion, kCGSEventTypeField, kCGSEventGesture);
     }
-    // Re-serialization can discard userData; tag after augmentation.
-    CGEventSetIntegerValueField(ev, kCGEventSourceUserData, kJumpCutSyntheticTag);
-    if (companion) {
-        CGEventSetIntegerValueField(companion, kCGEventSourceUserData, kJumpCutSyntheticTag);
+    // Re-serialization may discard userData. Tag only the final objects.
+    CGEventSetIntegerValueField(out->dock, kCGEventSourceUserData, kJumpCutSyntheticTag);
+    if (CGEventGetIntegerValueField(out->dock, kCGEventSourceUserData) != kJumpCutSyntheticTag) {
+        return false;
     }
-    CGEventPost(kCGSessionEventTap, ev);
-    if (companion) {
-        CGEventPost(kCGSessionEventTap, companion);
-        CFRelease(companion);
+    if (out->companion) {
+        CGEventSetIntegerValueField(out->companion, kCGEventSourceUserData, kJumpCutSyntheticTag);
+        if (CGEventGetIntegerValueField(out->companion, kCGEventSourceUserData) != kJumpCutSyntheticTag) {
+            return false;
+        }
     }
-    CFRelease(ev);
     return true;
 }
 
-static bool post_dock_swipe(CGSGesturePhase phase, StrafeDirection direction, double velocity) {
-    const bool isRight = (direction == StrafeDirectionRight);
-    // macOS 27: near-zero progress can race WindowServer's compositor.
-    // noswoosh 1.7.7 measured 0.1 progress with 9999 terminal velocity as
-    // fast and safer on tested hardware. JumpCut still needs runtime testing.
-    const bool augmented = strafe_uses_iohid_payload();
-    const double magnitude = augmented ? 0.1 : (double)FLT_TRUE_MIN;
-    const double progress = isRight ? magnitude : -magnitude;
-    const double effectiveVelocity = augmented ? 9999.0 : velocity;
-    const double vel = augmented && phase != kCGSGesturePhaseEnded
-        ? 0.0 : (isRight ? effectiveVelocity : -effectiveVelocity);
+static void post_phase(const PreparedPhase *phase) {
+    CGEventPost(kCGSessionEventTap, phase->dock);
+    if (phase->companion) { CGEventPost(kCGSessionEventTap, phase->companion); }
+}
 
-    return post_dock_swipe_shaped(phase, progress, vel);
+void strafe_post_prepared_gesture(StrafePreparedGesture *gesture) {
+    if (!gesture) { return; }
+    for (uint32_t i = 0; i < gesture->phaseCount; i++) {
+        post_phase(&gesture->phases[i]);
+        if (gesture->phases[i].delayAfterMicroseconds) {
+            usleep(gesture->phases[i].delayAfterMicroseconds);
+        }
+    }
+}
+
+StrafePreparedGesture *strafe_prepare_switch_gesture(StrafeDirection direction, double velocity) {
+    if ((direction != StrafeDirectionLeft && direction != StrafeDirectionRight)
+        || !isfinite(velocity) || velocity <= 0) { return NULL; }
+    const bool augmented = strafe_uses_iohid_payload();
+    const bool reversed = augmented && natural_scrolling_enabled();
+    const double sign = direction == StrafeDirectionRight ? 1.0 : -1.0;
+    // Existing macOS 27 profile from noswoosh's measurements. This preparation
+    // guarantee does not establish compositor correctness on any OS build.
+    const double progress = sign * (augmented ? 0.1 : (double)FLT_TRUE_MIN);
+    const CGSGesturePhase phases[] = {
+        kCGSGesturePhaseBegan, kCGSGesturePhaseChanged, kCGSGesturePhaseEnded
+    };
+    StrafePreparedGesture *gesture = allocate_gesture(3);
+    if (!gesture) { return NULL; }
+    for (uint32_t i = 0; i < 3; i++) {
+        double speed = augmented ? (i == 2 ? sign * 9999.0 : 0.0) : sign * velocity;
+        if (!prepare_phase(&gesture->phases[i], phases[i], progress, speed, augmented, reversed)) {
+            strafe_free_prepared_gesture(gesture);
+            return NULL;
+        }
+    }
+    return gesture;
+}
+
+StrafePreparedGesture *strafe_prepare_ramp_gesture(StrafeDirection direction,
+    double peakProgress, double endVelocity, uint32_t steps, uint32_t delayMicroseconds) {
+    if ((direction != StrafeDirectionLeft && direction != StrafeDirectionRight)
+        || !isfinite(peakProgress) || peakProgress <= 0
+        || !isfinite(endVelocity) || endVelocity <= 0
+        || steps == 0 || steps > UINT32_MAX - 2) { return NULL; }
+    const bool augmented = strafe_uses_iohid_payload();
+    const bool reversed = augmented && natural_scrolling_enabled();
+    const double sign = direction == StrafeDirectionRight ? 1.0 : -1.0;
+    StrafePreparedGesture *gesture = allocate_gesture(steps + 2);
+    if (!gesture) { return NULL; }
+    for (uint32_t i = 0; i < gesture->phaseCount; i++) {
+        CGSGesturePhase phase = i == 0 ? kCGSGesturePhaseBegan
+            : (i == steps + 1 ? kCGSGesturePhaseEnded : kCGSGesturePhaseChanged);
+        double fraction = i == steps + 1 ? 1.0 : (double)i / (double)steps;
+        if (!prepare_phase(&gesture->phases[i], phase, sign * peakProgress * fraction,
+                           sign * endVelocity * fraction, augmented, reversed)) {
+            strafe_free_prepared_gesture(gesture);
+            return NULL;
+        }
+        if (phase == kCGSGesturePhaseChanged) {
+            gesture->phases[i].delayAfterMicroseconds = delayMicroseconds;
+        }
+    }
+    return gesture;
 }
 
 bool strafe_post_switch_gesture(StrafeDirection direction, double velocity) {
-    // Send three gesture events--began, changed, and ended.
-    // If we only send two then mission control doesn't work.
-    return post_dock_swipe(kCGSGesturePhaseBegan,   direction, velocity)
-        && post_dock_swipe(kCGSGesturePhaseChanged, direction, velocity)
-        && post_dock_swipe(kCGSGesturePhaseEnded,   direction, velocity);
+    StrafePreparedGesture *gesture = strafe_prepare_switch_gesture(direction, velocity);
+    if (!gesture) { return false; }
+    strafe_post_prepared_gesture(gesture);
+    strafe_free_prepared_gesture(gesture);
+    return true;
 }
 
-// One phase with caller-chosen progress and velocity, for the animated
-// Transition speed presets (SPEC §1.4). A began, then a `changed` stream whose
-// progress climbs, then an ended is what makes the WindowServer run its slide
-// instead of flicking. The instant preset does not use this — it still goes
-// through `strafe_post_switch_gesture` above, unchanged.
 bool strafe_post_dock_swipe_phase(int64_t phase, double progress, double velocity) {
-    return post_dock_swipe_shaped((CGSGesturePhase)phase, progress, velocity);
+    const bool augmented = strafe_uses_iohid_payload();
+    const bool reversed = augmented && natural_scrolling_enabled();
+    PreparedPhase prepared = {0};
+    bool success = prepare_phase(&prepared, (CGSGesturePhase)phase,
+                                progress, velocity, augmented, reversed);
+    if (success) { post_phase(&prepared); }
+    free_phase(&prepared);
+    return success;
 }
+
+#ifdef JUMPCUT_PREPARATION_TESTING
+#undef calloc
+#undef free
+#undef CGEventCreate
+#undef CGEventSetIntegerValueField
+#undef CFRelease
+#undef usleep
+#endif
 
 // --- Topology (SPEC §6) ---------------------------------------------------
-// Read the cursor display's UUID string.
+// A failed or ambiguous cursor lookup is unknown, not the first display.
 static CFStringRef copy_cursor_display_identifier(void) {
     CGEventRef locEvent = CGEventCreate(NULL);
     if (!locEvent) { return NULL; }
@@ -186,104 +294,115 @@ static CFStringRef copy_cursor_display_identifier(void) {
 
     CGDirectDisplayID displays[16];
     uint32_t matching = 0;
-    if (CGGetDisplaysWithPoint(loc, 16, displays, &matching) != kCGErrorSuccess || matching == 0) {
+    if (CGGetDisplaysWithPoint(loc, 16, displays, &matching) != kCGErrorSuccess || matching != 1) {
         return NULL;
     }
     CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(displays[0]);
     if (!uuid) { return NULL; }
     CFStringRef str = CFUUIDCreateString(NULL, uuid);
     CFRelease(uuid);
-    return str; // caller releases
+    return str;
 }
+
+static bool valid_display_identifier(CFTypeRef value) {
+    if (!value || CFGetTypeID(value) != CFStringGetTypeID()) { return false; }
+    CFStringRef string = (CFStringRef)value;
+    CFIndex length = CFStringGetLength(string);
+    if (length == 0 || length >= (CFIndex)sizeof(((StrafeInfo *)0)->displayID)) { return false; }
+    for (CFIndex i = 0; i < length; i++) {
+        if (CFStringGetCharacterAtIndex(string, i) == 0) { return false; }
+    }
+    return true;
+}
+
+static bool read_space_id(CFTypeRef value, uint64_t *outID) {
+    if (!value || CFGetTypeID(value) != CFNumberGetTypeID() || CFNumberIsFloatType(value)) {
+        return false;
+    }
+    int64_t identifier = 0;
+    if (!CFNumberGetValue(value, kCFNumberSInt64Type, &identifier) || identifier <= 0) {
+        return false;
+    }
+    *outID = (uint64_t)identifier;
+    return true;
+}
+
+// Parse the same private snapshot used by the live query. Never skip malformed
+// entries: that would change the meaning of a positional boundary/index.
+static bool parse_space_info(CFTypeRef displaysValue, CFTypeRef targetDisplay, StrafeInfo *outInfo) {
+    if (!outInfo) { return false; }
+    memset(outInfo, 0, sizeof(*outInfo));
+    if (!valid_display_identifier(targetDisplay) || !displaysValue ||
+        CFGetTypeID(displaysValue) != CFArrayGetTypeID()) { return false; }
+
+    CFArrayRef displays = (CFArrayRef)displaysValue;
+    CFDictionaryRef display = NULL;
+    CFIndex displayCount = CFArrayGetCount(displays);
+    for (CFIndex i = 0; i < displayCount; i++) {
+        CFTypeRef candidate = CFArrayGetValueAtIndex(displays, i);
+        if (!candidate || CFGetTypeID(candidate) != CFDictionaryGetTypeID()) { return false; }
+        CFTypeRef identifier = CFDictionaryGetValue(candidate, CFSTR("Display Identifier"));
+        if (!valid_display_identifier(identifier)) { return false; }
+        if (CFEqual(identifier, targetDisplay)) {
+            if (display) { return false; } // Duplicate identities are ambiguous.
+            display = (CFDictionaryRef)candidate;
+        }
+    }
+    if (!display) { return false; }
+
+    CFTypeRef spacesValue = CFDictionaryGetValue(display, CFSTR("Spaces"));
+    CFTypeRef activeValue = CFDictionaryGetValue(display, CFSTR("Current Space"));
+    if (!spacesValue || CFGetTypeID(spacesValue) != CFArrayGetTypeID() ||
+        !activeValue || CFGetTypeID(activeValue) != CFDictionaryGetTypeID()) { return false; }
+    CFArrayRef spaces = (CFArrayRef)spacesValue;
+    CFIndex count = CFArrayGetCount(spaces);
+    if (count <= 0 || count > STRAFE_MAX_SPACES) { return false; }
+    uint64_t activeID = 0;
+    if (!read_space_id(CFDictionaryGetValue(activeValue, CFSTR("id64")), &activeID)) { return false; }
+
+    StrafeInfo info = {0};
+    bool activeFound = false;
+    for (CFIndex i = 0; i < count; i++) {
+        CFTypeRef space = CFArrayGetValueAtIndex(spaces, i);
+        if (!space || CFGetTypeID(space) != CFDictionaryGetTypeID() ||
+            !read_space_id(CFDictionaryGetValue(space, CFSTR("id64")), &info.spaceIDs[i])) {
+            return false;
+        }
+        for (CFIndex previous = 0; previous < i; previous++) {
+            if (info.spaceIDs[previous] == info.spaceIDs[i]) { return false; }
+        }
+        if (info.spaceIDs[i] == activeID) {
+            info.currentIndex = (unsigned int)i;
+            activeFound = true;
+        }
+    }
+    if (!activeFound || !CFStringGetCString((CFStringRef)targetDisplay, info.displayID,
+                                            sizeof(info.displayID), kCFStringEncodingUTF8)) {
+        return false;
+    }
+    info.spaceCount = (unsigned int)count;
+    *outInfo = info;
+    return true;
+}
+
+#ifdef JUMPCUT_TESTING
+// Not present in the app or its public module. Tests supply real CF containers
+// to the production parser without consulting or changing the CI desktop.
+bool strafe_test_parse_space_info(CFTypeRef displays, CFTypeRef target, StrafeInfo *outInfo) {
+    return parse_space_info(displays, target, outInfo);
+}
+#endif
 
 bool strafe_get_space_info(StrafeInfo *outInfo) {
     if (!outInfo) { return false; }
-    if (!strafe_cgs_available()) { return false; }
-
     memset(outInfo, 0, sizeof(*outInfo));
-
-    CGSConnectionID conn = CGSMainConnectionID();
-
+    if (!strafe_cgs_available()) { return false; }
     CFStringRef targetDisplay = copy_cursor_display_identifier();
-    // Fall back to the menu-bar display identifier if cursor lookup failed.
-    if (!targetDisplay && (&CGSCopyActiveMenuBarDisplayIdentifier != NULL)) {
-        targetDisplay = CGSCopyActiveMenuBarDisplayIdentifier(conn);
-    }
-
-    CFArrayRef displaySpaces = CGSCopyManagedDisplaySpaces(conn, NULL);
-    if (!displaySpaces) {
-        if (targetDisplay) { CFRelease(targetDisplay); }
-        return false;
-    }
-
-    CFIndex displayCount = CFArrayGetCount(displaySpaces);
-    if (displayCount == 0) {
-        if (targetDisplay) { CFRelease(targetDisplay); }
-        CFRelease(displaySpaces);
-        return false;
-    }
-
-    // Pick the matching display dict; if the target isn't found, fall back to
-    // the first display in the list (SPEC §6).
-    CFDictionaryRef displayDict = NULL;
-    if (targetDisplay) {
-        for (CFIndex d = 0; d < displayCount; d++) {
-            CFDictionaryRef candidate = (CFDictionaryRef)CFArrayGetValueAtIndex(displaySpaces, d);
-            if (!candidate) { continue; }
-            CFStringRef ident = (CFStringRef)CFDictionaryGetValue(candidate, CFSTR("Display Identifier"));
-            if (ident && CFStringCompare(ident, targetDisplay, 0) == kCFCompareEqualTo) {
-                displayDict = candidate;
-                break;
-            }
-        }
-    }
-    if (!displayDict) {
-        displayDict = (CFDictionaryRef)CFArrayGetValueAtIndex(displaySpaces, 0);
-    }
-
-    bool found = false;
-    if (displayDict) {
-        CFStringRef displayIdentifier = (CFStringRef)CFDictionaryGetValue(displayDict, CFSTR("Display Identifier"));
-
-        CFArrayRef spaces = (CFArrayRef)CFDictionaryGetValue(displayDict, CFSTR("Spaces"));
-        if (spaces) {
-            CFIndex count = CFArrayGetCount(spaces);
-            outInfo->spaceCount = (unsigned int)count;
-
-            // Determine the current space id for this display.
-            CGSSpaceID currentSpaceID = 0;
-            CFDictionaryRef currentSpace = (CFDictionaryRef)CFDictionaryGetValue(displayDict, CFSTR("Current Space"));
-            if (currentSpace) {
-                CFNumberRef id64 = (CFNumberRef)CFDictionaryGetValue(currentSpace, CFSTR("id64"));
-                if (id64) { CFNumberGetValue(id64, kCFNumberSInt64Type, &currentSpaceID); }
-            }
-            if (currentSpaceID == 0) {
-                currentSpaceID = CGSGetActiveSpace(conn);
-            }
-
-            // Map the current space id to a zero-based index within this display.
-            outInfo->currentIndex = 0;
-            for (CFIndex s = 0; s < count; s++) {
-                CFDictionaryRef spaceDict = (CFDictionaryRef)CFArrayGetValueAtIndex(spaces, s);
-                if (!spaceDict) { continue; }
-                CFNumberRef idNum = (CFNumberRef)CFDictionaryGetValue(spaceDict, CFSTR("id64"));
-                CGSSpaceID sid = 0;
-                if (idNum) { CFNumberGetValue(idNum, kCFNumberSInt64Type, &sid); }
-                if (sid == currentSpaceID) {
-                    outInfo->currentIndex = (unsigned int)s;
-                    break;
-                }
-            }
-
-            if (displayIdentifier) {
-                CFStringGetCString(displayIdentifier, outInfo->displayID, sizeof(outInfo->displayID), kCFStringEncodingUTF8);
-            }
-            found = true;
-        }
-    }
-
-    if (targetDisplay) { CFRelease(targetDisplay); }
-    CFRelease(displaySpaces);
+    if (!targetDisplay) { return false; }
+    CFArrayRef displays = CGSCopyManagedDisplaySpaces(CGSMainConnectionID(), NULL);
+    bool found = parse_space_info(displays, targetDisplay, outInfo);
+    if (displays) { CFRelease(displays); }
+    CFRelease(targetDisplay);
     return found;
 }
 
@@ -378,12 +497,24 @@ uint64_t strafe_tap_event_mask(void) {
 // --- Overlay / Exposé detection (SPEC §2.5) -------------------------------
 // Heuristic: count Dock-owned windows at layers 18 and 20.
 bool strafe_is_expose_active(void) {
+    return strafe_is_expose_active_with_diagnostics(NULL);
+}
+
+bool strafe_is_expose_active_with_diagnostics(StrafeOverlayDiagnostics *outDiagnostics) {
+    StrafeOverlayDiagnostics diagnostics = {0};
+    // Do not treat a lone Dock-owned layer-20 window as an overlay. A real
+    // macOS 27.2 (26B123) capture observed layer18=0/layer20=1 on the normal
+    // desktop for every valid four-finger Space swipe, so that upstream
+    // macOS-27 shortcut creates a persistent false positive. Keep the older,
+    // more specific layer-18 + layer-20 evidence below.
     CFArrayRef windows = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-    if (!windows) { return false; }
+    if (!windows) {
+        if (outDiagnostics) { *outDiagnostics = diagnostics; }
+        return false;
+    }
+    diagnostics.querySucceeded = true;
 
-    int layer18Count = 0;
-    int layer20Count = 0;
     CFIndex count = CFArrayGetCount(windows);
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef win = (CFDictionaryRef)CFArrayGetValueAtIndex(windows, i);
@@ -397,19 +528,17 @@ bool strafe_is_expose_active(void) {
         if (!layerNum) { continue; }
         int layer = 0;
         CFNumberGetValue(layerNum, kCFNumberIntType, &layer);
-        if (layer == 18) { layer18Count++; }
-        else if (layer == 20) { layer20Count++; }
+        if (layer == 18) { diagnostics.layer18Count++; }
+        else if (layer == 20) { diagnostics.layer20Count++; }
     }
     CFRelease(windows);
+    if (outDiagnostics) { *outDiagnostics = diagnostics; }
 
     // App Exposé: layer18Count > 0 && layer20Count > 0 && layer20Count <= layer18Count.
     // Mission Control: layer18Count > 0 && layer20Count > layer18Count.
-    if (layer18Count > 0 && layer20Count > 0 && layer20Count <= layer18Count) { return true; }
-    if (layer18Count > 0 && layer20Count > layer18Count) { return true; }
-    // macOS 27 Mission Control can show a lone Dock window at layer 20.
-    // Earlier systems retain the existing layer-18 requirement.
-    if (__builtin_available(macOS 27.0, *)) {
-        if (layer20Count > 0) { return true; }
-    }
+    if (diagnostics.layer18Count > 0 && diagnostics.layer20Count > 0 &&
+        diagnostics.layer20Count <= diagnostics.layer18Count) { return true; }
+    if (diagnostics.layer18Count > 0 &&
+        diagnostics.layer20Count > diagnostics.layer18Count) { return true; }
     return false;
 }

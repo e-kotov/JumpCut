@@ -34,7 +34,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var recorders: [ShortcutAction: ShortcutRecorder] = [:]
     private var recordingAction: ShortcutAction?
     private let enableShortcuts = NSButton(checkboxWithTitle: "Enable keyboard shortcuts", target: nil, action: nil)
-    private let speed = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let accelerateSwipes = NSButton(checkboxWithTitle: "Accelerate trackpad Space swipes", target: nil, action: nil)
+    private let durationSlider = NSSlider(value: 0, minValue: 0, maxValue: Double(TransitionSpeed.maximumMilliseconds), target: nil, action: nil)
+    private let durationField = NSTextField(string: "0")
+    private var durationStepper: NSStepper?
     private let message = NSTextField(wrappingLabelWithString: "")
     private let swipeStatus = NSTextField(wrappingLabelWithString: "")
     private var statusTimer: Timer?
@@ -46,6 +49,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 600),
                               styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "JumpCut Settings"
+        // Keep this window available while switching Spaces, including when
+        // testing changes via four-finger swipes without closing Settings.
+        window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
         window.isReleasedWhenClosed = false
         window.identifier = NSUserInterfaceItemIdentifier("JumpCut.settings")
         super.init(window: window)
@@ -129,17 +135,54 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let transitions = NSTextField(labelWithString: "Space transitions")
         transitions.font = .systemFont(ofSize: 16, weight: .semibold)
         stack.addArrangedSubview(transitions)
-        speed.addItems(withTitles: TransitionSpeed.allCases.map(\.title))
-        speed.target = self
-        speed.action = #selector(changeSpeed)
-        speed.isEnabled = engine != nil
-        speed.setAccessibilityLabel("Transition speed for swipes and keyboard shortcuts")
-        stack.addArrangedSubview(NSStackView(views: [NSTextField(labelWithString: "Transition speed"), speed]))
-        let speedHelp = NSTextField(wrappingLabelWithString: "Applies to both trackpad swipes and keyboard shortcuts.")
+        accelerateSwipes.target = self
+        accelerateSwipes.action = #selector(toggleSwipeAcceleration)
+        accelerateSwipes.isEnabled = engine != nil
+        accelerateSwipes.setAccessibilityLabel("Accelerate trackpad Space swipes, or use native macOS animation when off")
+        stack.addArrangedSubview(accelerateSwipes)
+        durationSlider.isContinuous = true
+        durationSlider.target = self
+        durationSlider.action = #selector(slideDuration(_:))
+        durationSlider.isEnabled = engine != nil
+        durationSlider.setAccessibilityLabel("Transition pacing, zero is instant")
+        durationSlider.widthAnchor.constraint(equalToConstant: 300).isActive = true
+
+        durationField.target = self
+        durationField.action = #selector(commitDuration(_:))
+        durationField.isEnabled = engine != nil
+        durationField.alignment = .right
+        durationField.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        durationField.setAccessibilityLabel("Transition pacing in milliseconds")
+        let stepper = NSStepper()
+        stepper.minValue = 0
+        stepper.maxValue = Double(TransitionSpeed.maximumMilliseconds)
+        stepper.increment = 1
+        stepper.valueWraps = false
+        stepper.isEnabled = engine != nil
+        stepper.target = self
+        stepper.action = #selector(stepDuration(_:))
+        stepper.setAccessibilityLabel("Adjust transition pacing by one millisecond")
+        durationStepper = stepper
+
+        let durationRow = NSStackView(views: [
+            NSTextField(labelWithString: "Instant"), durationSlider,
+            durationField, NSTextField(labelWithString: "ms"), stepper
+        ])
+        durationRow.spacing = 10
+        stack.addArrangedSubview(durationRow)
+        let speedHelp = NSTextField(wrappingLabelWithString:
+            "0 ms uses an instant switch. Drag the slider or use the stepper for 1 ms changes. Enter an exact value (0–120 ms) and press Return. Each change applies to the very next swipe or shortcut, even while Settings stays open.")
         speedHelp.font = .systemFont(ofSize: 12)
         speedHelp.textColor = .secondaryLabelColor
         stack.addArrangedSubview(speedHelp)
         speedHelp.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let accelerationHelp = NSTextField(wrappingLabelWithString:
+            "Turn acceleration off for normal macOS swipes. JumpCut stays running; keyboard shortcuts are independent.")
+        accelerationHelp.font = .systemFont(ofSize: 12)
+        accelerationHelp.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(accelerationHelp)
+        accelerationHelp.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         let gestureDivider = NSBox()
         gestureDivider.boxType = .separator
@@ -164,12 +207,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             recorder.title = recorder.recording ? "Type shortcut… (Esc cancels)" : (action.storedShortcut?.displayName ?? "Record Shortcut…")
         }
         if let error = hotkeys.registrationError { message.stringValue = error }
-        speed.selectItem(at: (engine?.transitionSpeed ?? TransitionSpeed.stored).rawValue)
-        refreshSwipeStatus()
+        displayDuration(engine?.transitionSpeed ?? TransitionSpeed.stored)
+        refreshSwipeControls()
+    }
+
+    func refreshSwipeControls() {
+        accelerateSwipes.state = interceptor.overrideEnabled ? .on : .off
+        swipeStatus.stringValue = interceptor.statusDescription
     }
 
     private func refreshSwipeStatus() {
-        swipeStatus.stringValue = interceptor.statusDescription
+        refreshSwipeControls()
+    }
+
+    @objc private func toggleSwipeAcceleration() {
+        let enabled = accelerateSwipes.state == .on
+        interceptor.overrideEnabled = enabled
+        SwipeAccelerationPreference.persist(enabled)
+        if enabled && !interceptor.isRunning { interceptor.start() }
+        refreshSwipeControls()
     }
 
     @objc private func beginRecording(_ sender: NSButton) {
@@ -225,10 +281,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         refresh()
     }
 
-    @objc private func changeSpeed() {
-        let selected = TransitionSpeed.from(rawValue: speed.indexOfSelectedItem)
-        selected.persist()
-        engine?.setTransitionSpeed(selected)
+    private func displayDuration(_ duration: TransitionSpeed) {
+        durationSlider.doubleValue = Double(duration.milliseconds)
+        durationField.stringValue = "\(duration.milliseconds)"
+        durationStepper?.integerValue = duration.milliseconds
+    }
+
+    // Each slider event applies synchronously. No delayed commit, debounce,
+    // window-close callback or app restart is needed.
+    private func applyDuration(_ milliseconds: Int) {
+        let duration = TransitionSpeed(milliseconds: milliseconds)
+        engine?.setTransitionSpeed(duration)
+        duration.persist()
+        displayDuration(duration)
+    }
+
+    @objc private func slideDuration(_ sender: NSSlider) {
+        applyDuration(Int(sender.doubleValue.rounded()))
+    }
+
+    @objc private func stepDuration(_ sender: NSStepper) {
+        applyDuration(sender.integerValue)
+    }
+
+    @objc private func commitDuration(_ sender: NSTextField) {
+        let value = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let milliseconds = Int(value), (0...TransitionSpeed.maximumMilliseconds).contains(milliseconds) else {
+            displayDuration(engine?.transitionSpeed ?? TransitionSpeed.stored)
+            return
+        }
+        applyDuration(milliseconds)
     }
 
     func windowDidResignKey(_ notification: Notification) { cancelRecording() }

@@ -1,5 +1,14 @@
 # bench — time-to-interactivity harness + video tooling for strafe
 
+> **JumpCut / macOS 27:** This is inherited benchmark documentation and its
+> historical numbers are not JumpCut measurements. Use the current
+> [validation procedure](../docs/VALIDATION.md). The `strafe` mode exercises the
+> real C poster but bypasses the app's prediction engine and physical swipe
+> interception. The `native` mode emits legacy unaugmented gestures and is not a
+> verified macOS 27 baseline; compare physical native swipes with interception
+> paused. Synthetic click delivery is a lower bound, not proof of physical input
+> readiness. `record.sh` excludes the menu bar, so it cannot validate that region.
+
 `bench` measures, honestly and reproducibly, the thing strafe claims to improve:
 **how long after you trigger a Space switch the landed window is actually
 interactive** — i.e. how long until a click on the new Space is delivered to the

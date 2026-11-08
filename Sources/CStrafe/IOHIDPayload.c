@@ -6,6 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef JUMPCUT_PREPARATION_TESTING
+#include "PreparationTestHooks.h"
+#define malloc strafe_test_malloc
+#define free strafe_test_free
+#define CGEventCreateData strafe_test_event_create_data
+#define CFDataCreate strafe_test_data_create
+#define CGEventCreateFromData strafe_test_event_from_data
+#define CFRelease strafe_test_release
+#endif
+
 static const CGEventField kCGEventGestureSwipePositionX = 125;
 static const CGEventField kCGEventGestureSwipePositionY = 126;
 static const CGEventField kCGEventGestureSwipeMask = 115;

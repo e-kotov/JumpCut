@@ -2,7 +2,7 @@ import Foundation
 import CStrafe
 
 /// The direction to move between macOS Spaces.
-enum SwitchDirection {
+enum SwitchDirection: Sendable {
     case left
     case right
 
@@ -11,27 +11,25 @@ enum SwitchDirection {
     }
 }
 
-/// Error surfaced when a synthetic switch could not be produced.
-enum SwitchEngineError: Error {
-    /// The bounds guard blocked a swipe past the first/last space (SPEC §2.4).
+enum SwitchEngineError: Error, Equatable {
     case atEdge
-    /// `CGEventCreate` failed — no event could be posted.
+    /// Preparation failed; none of this sequence's events were posted.
     case postFailed
+    case topologyUnavailable
+    /// Another complete gesture is being prepared or submitted.
+    case busy
 }
 
-/// Abstraction over the mechanism that actually moves between Spaces.
-///
-/// The real implementation (`GestureSwitchEngine`) posts synthetic
-/// high-velocity dock-swipe gestures and is being specced separately.
-/// Everything in this app is built against this protocol so the engine
-/// can be swapped in without touching call sites.
 protocol SwitchEngine {
     func switchSpace(_ direction: SwitchDirection) throws
+    /// Checked before the interceptor takes ownership of a native gesture.
+    func canInterceptGesture() -> Bool
 }
 
-/// No-op engine used during development, tests, and dry runs. Logs the
-/// requested switch and returns. Kept around as a safe stand-in for the real
-/// engine (e.g. when Accessibility isn't granted, or in unit tests).
+extension SwitchEngine {
+    func canInterceptGesture() -> Bool { true }
+}
+
 struct StubSwitchEngine: SwitchEngine {
     func switchSpace(_ direction: SwitchDirection) throws {
         let arrow = direction == .left ? "←" : "→"
@@ -41,163 +39,190 @@ struct StubSwitchEngine: SwitchEngine {
     }
 }
 
-/// The real engine: posts a synthetic high-velocity dock-swipe gesture (SPEC
-/// §1) to jump to the neighboring Space instantly.
-///
-/// Concurrency: `switchSpace` may be called from the main actor (hotkeys, CLI)
-/// or from the event-tap run loop (the interceptor). All mutable prediction
-/// state is guarded by an `NSLock`, so the type is safe to share across those
-/// contexts; the actual CGEvent posting (`strafe_post_switch_gesture`) is a
-/// stateless C call.
+/// Owns an already prepared C sequence. Releasing an unused owner also releases
+/// every prepared event. The engine submits each owner only once.
+private final class PreparedGesture: @unchecked Sendable {
+    private let pointer: OpaquePointer
+
+    init(_ pointer: OpaquePointer) { self.pointer = pointer }
+    func post() { strafe_post_prepared_gesture(pointer) }
+    deinit { strafe_free_prepared_gesture(pointer) }
+}
+
+/// Bounds and predictions are meaningful only for a complete, identified
+/// topology. Validate the injected seam as well as the C parser's output.
+private struct SpaceSnapshot {
+    let displayID: String
+    let spaces: [UInt64]
+    let current: Int
+
+    init?(_ info: StrafeInfo?) {
+        guard let info, info.spaceCount > 0, info.currentIndex < info.spaceCount else {
+            return nil
+        }
+        let capacity = MemoryLayout.size(ofValue: info.spaceIDs) / MemoryLayout<UInt64>.stride
+        guard Int(info.spaceCount) <= capacity else { return nil }
+        guard let displayID = withUnsafeBytes(of: info.displayID, { raw -> String? in
+            guard let end = raw.firstIndex(of: 0), end > 0 else { return nil }
+            return String(bytes: raw.prefix(end), encoding: .utf8)
+        }) else { return nil }
+        let spaces = withUnsafeBytes(of: info.spaceIDs) {
+            Array($0.bindMemory(to: UInt64.self).prefix(Int(info.spaceCount)))
+        }
+        guard !spaces.contains(0), Set(spaces).count == spaces.count else { return nil }
+        self.displayID = displayID
+        self.spaces = spaces
+        self.current = Int(info.currentIndex)
+    }
+}
+
+/// Preparation, complete event submission and prediction updates share one
+/// lock. A concurrent request fails immediately instead of queuing stale work
+/// or interleaving streams. Instant has no sleeps; any positive user-selected
+/// ramp holds the calling thread for its pacing duration. The interceptor can
+/// forward its native terminal only after all synthetic events were submitted.
 final class GestureSwitchEngine: SwitchEngine, @unchecked Sendable {
-    /// Gesture velocity magnitude. 2000.0 is the "Instant" preset — the only
-    /// value that truly skips the slide animation (SPEC §1.4, §5). Lower values
-    /// keep a (shortened) animation.
     static let instantVelocity: Double = 2000.0
+    static let predictionLifetime: Duration = .milliseconds(500)
+
+    typealias PreparedPost = @Sendable () -> Void
+
+    private struct Prediction {
+        let spaces: [UInt64]
+        let expiresAt: ContinuousClock.Instant
+        var target: Int
+        var visited: Set<UInt64>
+    }
 
     private let velocity: Double
     private let spaceInfo: @Sendable () -> StrafeInfo?
-
-    /// Per-display predicted current-space index, keyed by display UUID
-    /// (SPEC §2.4). Avoids rebounding off the laggy live active-space query.
-    /// Also guards `speed`.
+    private let clock: @Sendable () -> ContinuousClock.Instant
+    private let prepare: @Sendable (SwitchDirection, TransitionSpeed, Double) -> PreparedPost?
     private let lock = NSLock()
-    private var predictions: [String: UInt32] = [:]
+    private var predictions: [String: Prediction] = [:]
     private var speed: TransitionSpeed = .default
-
-    /// Serial queue for the ramped (animated) transition speeds.
-    ///
-    /// A ramp is a sequence of posts spread over 30–120 ms, and `switchSpace` is
-    /// called from the event-tap callback, which runs on the **main run loop** —
-    /// sleeping there would stall the tap and every other main-thread client for
-    /// the length of the animation. So ramps are posted off-thread.
-    ///
-    /// Serial, not concurrent, and deliberately so: two swipes in quick
-    /// succession must not interleave their began/changed/ended streams. The
-    /// second ramp starts only once the first has posted its `ended`.
-    private let rampQueue = DispatchQueue(
-        label: "dev.ekotov.jumpcut.ramp", qos: .userInteractive
-    )
 
     init(velocity: Double = GestureSwitchEngine.instantVelocity,
          spaceInfo: @escaping @Sendable () -> StrafeInfo? = {
              var info = StrafeInfo()
              return strafe_get_space_info(&info) ? info : nil
+         },
+         clock: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock().now },
+         prepare: @escaping @Sendable (SwitchDirection, TransitionSpeed, Double) -> PreparedPost? = {
+             GestureSwitchEngine.prepareGesture($0, speed: $1, velocity: $2)
          }) {
         self.velocity = velocity
         self.spaceInfo = spaceInfo
+        self.clock = clock
+        self.prepare = prepare
     }
 
-    /// Whether the private CGS topology symbols resolved (SPEC §1.1, §6).
     var cgsAvailable: Bool { strafe_cgs_available() }
 
-    /// The current transition speed. Read/written under the same lock as the
-    /// predictions because the menu (main actor) sets it while the event-tap
-    /// callback reads it.
     var transitionSpeed: TransitionSpeed {
         lock.lock(); defer { lock.unlock() }
         return speed
     }
 
     func setTransitionSpeed(_ newValue: TransitionSpeed) {
-        lock.lock()
+        lock.lock(); defer { lock.unlock() }
         speed = newValue
-        lock.unlock()
     }
 
-    /// Block until any in-flight ramp has finished posting.
-    ///
-    /// Only CLI mode needs this: it issues one switch and then exits the
-    /// process, which would kill a ramp partway through its `changed` stream and
-    /// leave the gesture unfinished. The menu-bar app never calls it — blocking
-    /// there is exactly what `rampQueue` exists to avoid.
-    func waitForPendingSwitch() {
-        rampQueue.sync {}
-    }
-
-    /// Post one directional switch in whatever shape the current speed calls for.
-    ///
-    /// Returns whether the switch was *dispatched*, not whether it completed:
-    /// the instant path posts synchronously and can report a failed
-    /// `CGEventCreate`, while a ramp is handed to `rampQueue` and returns true
-    /// immediately. Either way the caller's optimistic prediction update is
-    /// correct, because that models where we are going, not where we are.
-    private func post(_ direction: SwitchDirection, speed: TransitionSpeed) -> Bool {
-        guard let rampMs = speed.rampMilliseconds else {
-            return strafe_post_switch_gesture(direction.cDirection, velocity)
-        }
-
-        let sign: Double = direction == .right ? 1.0 : -1.0
-        let steps = TransitionSpeed.rampSteps
-        let peak = TransitionSpeed.rampPeakProgress
-        let endVelocity = TransitionSpeed.rampEndVelocity
-        let perStep = UInt32((rampMs / Double(steps)) * 1000.0)   // µs
-
-        rampQueue.async {
-            // began: at rest. The motion in the `changed` stream below is what
-            // makes the WindowServer animate instead of jumping.
-            _ = strafe_post_dock_swipe_phase(strafe_gesture_phase_began(), 0.0, 0.0)
-            for step in 1...steps {
-                let frac = Double(step) / Double(steps)
-                _ = strafe_post_dock_swipe_phase(
-                    strafe_gesture_phase_changed(),
-                    sign * peak * frac,
-                    sign * endVelocity * frac
-                )
-                if perStep > 0 { usleep(perStep) }
-            }
-            // ended: a moderate velocity commits the switch with its animation.
-            _ = strafe_post_dock_swipe_phase(
-                strafe_gesture_phase_ended(), sign * peak, sign * endVelocity
+    private static func prepareGesture(_ direction: SwitchDirection,
+                                       speed: TransitionSpeed,
+                                       velocity: Double) -> PreparedPost? {
+        let pointer: OpaquePointer?
+        if let rampMs = speed.rampMilliseconds {
+            let steps = TransitionSpeed.rampSteps
+            pointer = strafe_prepare_ramp_gesture(
+                direction.cDirection, TransitionSpeed.rampPeakProgress,
+                TransitionSpeed.rampEndVelocity, UInt32(steps),
+                UInt32((rampMs / Double(steps)) * 1000.0)
             )
+        } else {
+            pointer = strafe_prepare_switch_gesture(direction.cDirection, velocity)
         }
+        guard let pointer else { return nil }
+        let gesture = PreparedGesture(pointer)
+        return { gesture.post() }
+    }
+
+    func canInterceptGesture() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = clock()
+        discardExpiredPredictions(at: now)
+        guard let snapshot = SpaceSnapshot(spaceInfo()) else {
+            predictions.removeAll(keepingCapacity: true)
+            return false
+        }
+        _ = prediction(for: snapshot, at: now)
         return true
     }
 
     func switchSpace(_ direction: SwitchDirection) throws {
-        // Read live topology once. If CGS symbols are unavailable we can't do
-        // bounds/prediction bookkeeping — fall back to posting unconditionally.
-        if let info = spaceInfo() {
-            let displayID = withUnsafeBytes(of: info.displayID) { raw -> String in
-                let ptr = raw.baseAddress!.assumingMemoryBound(to: CChar.self)
-                return String(cString: ptr)
-            }
-
-            lock.lock()
-            let current = predictions[displayID] ?? info.currentIndex
-
-            // Bounds guard (SPEC §2.4): never swipe past the first/last space.
-            if direction == .left {
-                if current == 0 { lock.unlock(); throw SwitchEngineError.atEdge }
-            } else {
-                if current + 1 >= info.spaceCount { lock.unlock(); throw SwitchEngineError.atEdge }
-            }
-
-            let target: UInt32 = direction == .left ? current - 1 : current + 1
-            let shape = speed
-            lock.unlock()
-
-            guard post(direction, speed: shape) else {
-                throw SwitchEngineError.postFailed
-            }
-
-            // Advance the optimistic prediction only after a successful post.
-            lock.lock()
-            predictions[displayID] = target
-            lock.unlock()
-        } else {
-            guard post(direction, speed: transitionSpeed) else {
-                throw SwitchEngineError.postFailed
-            }
+        guard lock.try() else { throw SwitchEngineError.busy }
+        defer { lock.unlock() }
+        let now = clock()
+        discardExpiredPredictions(at: now)
+        guard let snapshot = SpaceSnapshot(spaceInfo()) else {
+            predictions.removeAll(keepingCapacity: true)
+            throw SwitchEngineError.topologyUnavailable
         }
+        let pending = prediction(for: snapshot, at: now)
+        let current = pending?.target ?? snapshot.current
+        let target = current + (direction == .right ? 1 : -1)
+        guard snapshot.spaces.indices.contains(target) else { throw SwitchEngineError.atEdge }
+        // All allocations, augmentation and companions must succeed before
+        // submitting any event. The returned action cannot fail preparation
+        // halfway through a stream; CGEventPost still has no Dock acknowledgement.
+        guard let post = prepare(direction, speed, velocity) else {
+            throw SwitchEngineError.postFailed
+        }
+        var next = pending ?? Prediction(
+            spaces: snapshot.spaces,
+            expiresAt: now.advanced(by: Self.predictionLifetime),
+            target: current, visited: [snapshot.spaces[current]]
+        )
+        next.target = target
+        next.visited.insert(snapshot.spaces[target])
+        post()
+        predictions[snapshot.displayID] = next
     }
 
-    /// Reset all predictions to live CGS data. Call on
-    /// `NSWorkspace.activeSpaceDidChangeNotification` (SPEC §2.4, §5) so rapid
-    /// repeated swipes don't overshoot bounds or snap back off a stale index.
-    func resetPredictions() {
-        lock.lock()
-        predictions.removeAll(keepingCapacity: true)
-        lock.unlock()
+    /// Intermediate notifications can describe any Space visited in a burst.
+    /// In particular A→B→A cannot be declared finished just because live still
+    /// says A: a delayed B notification may follow it. Keep the final target
+    /// until the fixed deadline, or until live state lies outside that path.
+    /// An external switch to a visited Space is indistinguishable during this
+    /// short window; predictions never extend it by accepting more requests.
+    private func prediction(for snapshot: SpaceSnapshot,
+                            at now: ContinuousClock.Instant) -> Prediction? {
+        guard let prediction = predictions[snapshot.displayID] else { return nil }
+        guard now < prediction.expiresAt,
+              snapshot.spaces == prediction.spaces,
+              prediction.visited.contains(snapshot.spaces[snapshot.current]) else {
+            predictions.removeValue(forKey: snapshot.displayID)
+            return nil
+        }
+        return prediction
+    }
+
+    private func discardExpiredPredictions(at now: ContinuousClock.Instant) {
+        predictions = predictions.filter { now < $0.value.expiresAt }
+    }
+
+    /// Notifications do not identify their display. Reconcile the currently
+    /// queryable display and expire others; each display's next request also
+    /// checks its complete ordered topology before using its prediction.
+    func reconcilePredictions() {
+        lock.lock(); defer { lock.unlock() }
+        let now = clock()
+        discardExpiredPredictions(at: now)
+        guard let snapshot = SpaceSnapshot(spaceInfo()) else {
+            predictions.removeAll(keepingCapacity: true)
+            return
+        }
+        _ = prediction(for: snapshot, at: now)
     }
 }

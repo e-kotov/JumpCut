@@ -4,7 +4,7 @@ import AppKit
 /// interceptor / permission state. LSUIElement is set in the bundled
 /// Info.plist so there is no dock icon.
 @MainActor
-final class StatusItemController: NSObject, NSMenuDelegate {
+final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation {
     private let statusItem: NSStatusItem
     private let interceptor: SwipeInterceptor
     private let engine: GestureSwitchEngine?
@@ -12,18 +12,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var settings: SettingsWindowController?
 
     private let toggleItem = NSMenuItem(
-        title: "Enable", action: #selector(toggleEnabled), keyEquivalent: ""
+        title: "Enable swipe acceleration", action: #selector(toggleEnabled), keyEquivalent: ""
     )
     private let speedItem = NSMenuItem(
-        title: "Transition speed", action: nil, keyEquivalent: ""
+        title: "Transition pacing", action: #selector(showSettings), keyEquivalent: ""
     )
-    private var speedItems: [NSMenuItem] = []
     private let hotkeysItem = NSMenuItem(
         title: "Space-switch hotkeys", action: #selector(toggleHotkeys), keyEquivalent: ""
     )
     private let accessibilityItem = NSMenuItem(
         title: "Accessibility granted: —", action: nil, keyEquivalent: ""
     )
+    private let captureItem = NSMenuItem(
+        title: "Capture swipes (20 s)", action: #selector(startSwipeCapture), keyEquivalent: ""
+    )
+    private let copyReportItem = NSMenuItem(
+        title: "Copy swipe report", action: #selector(copySwipeReport), keyEquivalent: ""
+    )
+    private let captureStatusItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
 
     /// Shipped version, read from the bundle so `VERSION` stays the single
     /// source of truth (`Scripts/bundle.sh` stamps it into Info.plist). A bare
@@ -61,14 +67,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         accessibilityItem.isEnabled = false
 
         engine?.setTransitionSpeed(TransitionSpeed.stored)
+        interceptor.overrideEnabled = SwipeAccelerationPreference.stored
 
         menu.addItem(toggleItem)
-        buildSpeedSubmenu(into: menu)
+        if engine != nil {
+            speedItem.target = self
+            menu.addItem(speedItem)
+        }
         if hotkeys != nil {
             hotkeysItem.target = self
             menu.addItem(hotkeysItem)
         }
         menu.addItem(accessibilityItem)
+        menu.addItem(.separator())
+        captureItem.target = self
+        copyReportItem.target = self
+        captureStatusItem.isEnabled = false
+        menu.addItem(captureItem)
+        menu.addItem(copyReportItem)
+        menu.addItem(captureStatusItem)
         if settings != nil {
             menu.addItem(.separator())
             let item = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
@@ -114,52 +131,52 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         settings?.showSettings()
     }
 
-    /// The "Transition speed" submenu: one checkable item per preset.
-    ///
-    /// Hidden entirely when there is no real engine (stub engine / no
-    /// Accessibility), because nothing it offers would take effect.
-    private func buildSpeedSubmenu(into menu: NSMenu) {
-        guard engine != nil else { return }
-
-        let submenu = NSMenu()
-        for speed in TransitionSpeed.allCases {
-            let item = NSMenuItem(
-                title: speed.title, action: #selector(selectSpeed(_:)), keyEquivalent: ""
-            )
-            item.target = self
-            item.tag = speed.rawValue
-            submenu.addItem(item)
-            speedItems.append(item)
-        }
-
-        speedItem.submenu = submenu
-        menu.addItem(speedItem)
-    }
-
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
         refresh()
     }
 
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        menuItem !== copyReportItem || interceptor.diagnostics.hasReport
+    }
+
     // MARK: - Actions
+
+    @objc private func startSwipeCapture() {
+        interceptor.startSwipeDiagnostics()
+        copyReportItem.title = "Copy swipe report"
+        refresh()
+    }
+
+    @objc private func stopSwipeCapture() {
+        // Keep Stop bound to stopping even if the deadline expires while the
+        // menu is open; never turn a stale Stop action into a fresh capture.
+        interceptor.diagnostics.stop()
+        refresh()
+    }
+
+    @objc private func copySwipeReport() {
+        guard interceptor.diagnostics.hasReport else { return }
+        let report = interceptor.swipeDiagnosticsReport()
+        // An explicit Copy action writes the report; clipboard contents are
+        // never read. Nothing is saved or sent automatically.
+        NSPasteboard.general.clearContents()
+        let copied = NSPasteboard.general.setString(report, forType: .string)
+        copyReportItem.title = copied ? "Copy swipe report (copied)" : "Copy swipe report (retry)"
+        refresh()
+    }
 
     @objc private func toggleEnabled() {
         // Toggle interception. The tap stays alive (so it can re-enable itself
         // after a system auto-disable); `overrideEnabled` gates whether real
         // swipes are actually suppressed and replaced (SPEC §2.2).
         interceptor.overrideEnabled.toggle()
+        SwipeAccelerationPreference.persist(interceptor.overrideEnabled)
         if interceptor.overrideEnabled && !interceptor.isRunning {
             interceptor.start()
         }
-        refresh()
-    }
-
-    /// Pick a transition speed. Persisted so the choice survives a relaunch.
-    @objc private func selectSpeed(_ sender: NSMenuItem) {
-        let speed = TransitionSpeed.from(rawValue: sender.tag)
-        engine?.setTransitionSpeed(speed)
-        speed.persist()
+        settings?.refreshSwipeControls()
         refresh()
     }
 
@@ -201,13 +218,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     // MARK: - State
 
     private func refresh() {
-        toggleItem.title = interceptor.overrideEnabled ? "Disable" : "Enable"
+        toggleItem.title = interceptor.overrideEnabled
+            ? "Disable swipe acceleration" : "Enable swipe acceleration"
         if let engine {
-            let current = engine.transitionSpeed
-            speedItem.title = "Transition speed: \(current.title)"
-            for item in speedItems { item.state = item.tag == current.rawValue ? .on : .off }
+            speedItem.title = "Transition pacing: \(engine.transitionSpeed.title) — Settings…"
         }
         accessibilityItem.title = interceptor.statusDescription
+        let recording = interceptor.diagnostics.isRecording
+        captureItem.title = recording ? "Stop swipe capture" : "Capture swipes (20 s)"
+        captureItem.action = recording ? #selector(stopSwipeCapture) : #selector(startSwipeCapture)
+        captureStatusItem.title = interceptor.diagnostics.statusText
+        captureStatusItem.isHidden = !interceptor.diagnostics.hasReport
         hotkeysItem.state = HotkeyManager.enabled ? .on : .off
     }
 }
