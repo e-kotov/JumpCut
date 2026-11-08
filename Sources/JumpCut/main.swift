@@ -46,9 +46,6 @@ func runCLI(_ args: [String], engine: GestureSwitchEngine) -> Int32 {
         engine.setTransitionSpeed(TransitionSpeed.stored)
         do {
             try engine.switchSpace(direction)
-            // A ramped switch posts asynchronously; returning here exits the
-            // process, so drain it first or the gesture never finishes.
-            engine.waitForPendingSwitch()
             // `CGEventPost` hands the event to the WindowServer asynchronously.
             // Returning here exits immediately, and an exit that close behind the
             // post loses the gesture — measured: without this pause `JumpCut
@@ -68,27 +65,19 @@ func runCLI(_ args: [String], engine: GestureSwitchEngine) -> Int32 {
         return 0
 
     case "speed":
-        // Same setting the menu-bar "Transition speed" submenu writes; a running
-        // menu-bar app won't notice until relaunch.
         guard args.count >= 2 else {
-            let current = TransitionSpeed.stored
-            print("transition speed: \(current.title)")
-            let width = TransitionSpeed.allCases.map(\.name.count).max() ?? 0
-            for speed in TransitionSpeed.allCases {
-                let mark = speed == current ? "*" : " "
-                let pad = String(repeating: " ", count: width - speed.name.count)
-                print("  \(mark) \(speed.name)\(pad)  \(speed.title)")
-            }
+            print("transition pacing: \(TransitionSpeed.stored.title) (0–\(TransitionSpeed.maximumMilliseconds) ms)")
+            print("0 = instant; positive values pace the animation ramp.")
             return 0
         }
         guard let speed = TransitionSpeed(name: args[1]) else {
-            let names = TransitionSpeed.allCases.map(\.name).joined(separator: "|")
             FileHandle.standardError.write(Data(
-                "unknown speed '\(args[1])' (expected \(names))\n".utf8))
+                "invalid pacing '\(args[1])' (expected 0–\(TransitionSpeed.maximumMilliseconds) ms; legacy: instant|quick|smooth)\n".utf8
+            ))
             return 2
         }
         speed.persist()
-        print("transition speed: \(speed.title)")
+        print("transition pacing: \(speed.title)")
         return 0
 
     case "hotkeys":
@@ -119,7 +108,7 @@ func runCLI(_ args: [String], engine: GestureSwitchEngine) -> Int32 {
           JumpCut settings             open the settings window
           JumpCut switch left|right    switch space once and exit
           JumpCut status               print accessibility / tap status
-          JumpCut speed [preset]       show or set the swipe transition speed
+          JumpCut speed [0..120]       show or set the swipe ramp in ms (0=instant)
           JumpCut hotkeys [on|off]     show or set keyboard shortcut enablement
 
         """.utf8))
@@ -183,15 +172,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.statusItem?.showSettings() }
         }
 
-        // SPEC §2.4 / §5: reset the prediction dictionary to live CGS data
-        // whenever the OS reports a real space change, so rapid repeated swipes
-        // don't overshoot bounds or snap back off a stale predicted index.
+        // Reconcile bounded per-display predictions with live topology without
+        // discarding a rapid sequence on an intermediate Space notification.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil,
             queue: .main
         ) { [engine] _ in
-            engine.resetPredictions()
+            engine.reconcilePredictions()
         }
 
         interceptor.start()

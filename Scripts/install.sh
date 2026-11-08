@@ -88,6 +88,6 @@ Grant Accessibility to JumpCut in the pane that just opened, then:
   2. Check that JumpCut's menu says "Swipe interception is active". It retries
      automatically when permission becomes available. If macOS still holds an
      old build's permission identity, re-grant access and quit/relaunch JumpCut.
-  3. Three-finger swipe between Spaces. It should be instant.
+  3. Use your configured swipe between Spaces and check whether it is instant.
 
 EOF

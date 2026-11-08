@@ -1,6 +1,6 @@
 name: JumpCut CI
 
-on:
+on: 
   push:
     branches: [main]
   pull_request:
@@ -13,18 +13,35 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       # actions/checkout v4.2.2 — pinned by full commit SHA.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record tested commit and toolchain
+        run: |
+          git rev-parse HEAD
+          sw_vers
+          swift --version
 
       - name: Build (strict concurrency, warnings as errors)
+        id: compile
         run: swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 
-      - name: Test gesture payload serialization (no input events posted)
+      - name: Verify test hooks are absent from the app
+        run: |
+          if nm -g .build/debug/JumpCut | grep 'strafe_test_'; then
+            exit 1
+          fi
+
+      - name: Test preparation, payloads and topology (no input events posted)
         run: bash Tests/run.sh
 
-      - name: Test Space boundaries and gesture completion
+      - name: Test predictions, boundaries and interception
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         run: swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 
       - name: Test hotkey settings across processes (no shortcuts captured)
@@ -35,3 +52,56 @@ jobs:
 
       - name: Verify bundle assembles and ad-hoc signs
         run: codesign --verify --verbose=2 build/JumpCut.app
+
+      - name: Package and verify the downloadable test build
+        id: package
+        run: |
+          package_name="JumpCut-test-arm64-$(git rev-parse --short=12 HEAD)"
+          package_dir="build/$package_name"
+          mkdir -p "$package_dir" build/test-download
+          ditto build/JumpCut.app "$package_dir/JumpCut.app"
+          cp LICENSE docs/VALIDATION.md docs/INTEGRATION.md docs/THIRD_PARTY_NOTICES.md "$package_dir/"
+          ditto third_party "$package_dir/third_party"
+          {
+            printf 'JumpCut experimental test build (arm64, ad-hoc signed, not notarized)\n'
+            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'CI run: https://github.com/%s/actions/runs/%s\n\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'Install: quit any running JumpCut, drag JumpCut.app into /Applications, allow it in\n'
+            printf 'System Settings > Privacy & Security > Accessibility (remove stale JumpCut rows first),\n'
+            printf 'then confirm the menu reports "Swipe interception is active".\n'
+            sw_vers
+            swift --version
+          } > "$package_dir/START-HERE.txt"
+          {
+            printf 'JumpCut experimental test build (arm64, ad-hoc signed, not notarized)\n'
+            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'CI run: https://github.com/%s/actions/runs/%s\n\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            sw_vers
+            swift --version
+          } > "$package_dir/BUILD-INFO.txt"
+
+          # Upload one ZIP so the artifact service cannot strip app permissions.
+          archive="build/test-download/$package_name.zip"
+          ditto -c -k --keepParent "$package_dir" "$archive"
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          ditto -x -k "$archive" "$verify_dir"
+          unpacked_app="$verify_dir/$package_name/JumpCut.app"
+          test -x "$unpacked_app/Contents/MacOS/JumpCut"
+          test "$(lipo -archs "$unpacked_app/Contents/MacOS/JumpCut")" = arm64
+          codesign --verify --strict --verbose=2 "$unpacked_app"
+          cmp build/JumpCut.app/Contents/MacOS/JumpCut "$unpacked_app/Contents/MacOS/JumpCut"
+          otool -L "$unpacked_app/Contents/MacOS/JumpCut"
+          (cd build/test-download && shasum -a 256 "$package_name.zip" > "$package_name.zip.sha256")
+          cat "build/test-download/$package_name.zip.sha256"
+          echo "name=$package_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the verified test build
+        # actions/upload-artifact v4.6.2 — pinned by full commit SHA.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: build/test-download/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

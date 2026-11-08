@@ -23,19 +23,42 @@ final class BoundaryTests: XCTestCase {
             let posted = event(phase)
             posted.setIntegerValueField(.eventSourceUserData, value: 0x4A554D50)
             posted.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
+            XCTAssertEqual(posted.getIntegerValueField(.eventSourceUnixProcessID), 0)
+            XCTAssertEqual(posted.getIntegerValueField(.eventSourceUserData), 0x4A554D50)
             let result = interceptor.handle(type: CGEventType(rawValue: 30)!, event: posted)
             XCTAssertTrue(result?.takeUnretainedValue() === posted)
         }
         XCTAssertEqual(engine.attempts, 0)
     }
 
+    func testAccelerationOffPassesOriginalSwipeAndOnInterceptsAgain() {
+        let engine = RecordingEngine()
+        let interceptor = SwipeInterceptor(engine: engine, isExposeActive: { false })
+        interceptor.overrideEnabled = false
+        for phase: Int64 in [1, 2, 4] {
+            let sample = event(phase)
+            XCTAssertTrue(interceptor.handle(type: CGEventType(rawValue: 30)!, event: sample)?
+                .takeUnretainedValue() === sample)
+        }
+        XCTAssertEqual(engine.attempts, 0)
+        interceptor.overrideEnabled = true
+        XCTAssertNil(send(1, to: interceptor))
+        XCTAssertNil(send(2, to: interceptor))
+        XCTAssertEqual(engine.attempts, 1)
+        _ = send(4, to: interceptor)
+        interceptor.overrideEnabled = false
+        let sample = event(1)
+        XCTAssertTrue(interceptor.handle(type: CGEventType(rawValue: 30)!, event: sample)?
+            .takeUnretainedValue() === sample)
+    }
+
     func testEngineBlocksBothEdges() {
         for (index, direction) in [(UInt32(0), SwitchDirection.left), (4, .right)] {
             let engine = GestureSwitchEngine(spaceInfo: {
-                var info = StrafeInfo()
-                info.currentIndex = index
-                info.spaceCount = 5
-                return info
+                makeTestSpaceInfo(index: index)
+            }, prepare: { _, _, _ in
+                XCTFail("An edge must be rejected before gesture preparation")
+                return nil
             })
             for _ in 0..<3 {
                 XCTAssertThrowsError(try engine.switchSpace(direction)) { error in

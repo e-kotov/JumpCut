@@ -23,16 +23,19 @@ typedef enum {
     StrafeDirectionRight = 1,  // next space
 } StrafeDirection;
 
-// Topology for one display, filled by strafe_get_space_info().
+// Topology for one display, filled by strafe_get_space_info(). Larger or
+// malformed private responses are unavailable, so native swipes can pass through.
+#define STRAFE_MAX_SPACES 128
 typedef struct {
     unsigned int currentIndex;   // zero-based index of the active space on this display
     unsigned int spaceCount;     // number of spaces on this display
     char displayID[128];         // display UUID string, used as the prediction-dictionary key
+    uint64_t spaceIDs[STRAFE_MAX_SPACES]; // ordered IDs, including fullscreen Spaces
 } StrafeInfo;
 
 // --- Capability check (SPEC §1.1, §6) -------------------------------------
 // True iff the weak-imported CGS symbols resolved at load time. When false,
-// topology can't be read (bounds guard degrades) but synthesis still works.
+// topology can't be read. The interceptor leaves native swipes alone.
 bool strafe_cgs_available(void);
 
 // Runtime OS capability; macOS 27 requires augmented synthetic gestures.
@@ -44,17 +47,30 @@ bool strafe_event_moves_right(double progressOrVelocity);
 void strafe_clear_swipe_motion(CGEventRef event);
 
 // --- Synthesis (SPEC §1.4, §1.5) ------------------------------------------
-// Post one instant single-step dock swipe: began -> changed -> ended, all
-// immediately with no delay, to kCGSessionEventTap. Returns false only if an
-// event could not be created. `velocity` is the gesture speed magnitude
-// (default 2000.0 == "instant"); sign is applied internally from `direction`.
+// A complete gesture owns all its events (including macOS 27 companions).
+// Preparation samples the OS/direction convention once and posts nothing.
+// NULL means preparation failed; every partially prepared object was released.
+typedef struct StrafePreparedGesture StrafePreparedGesture;
+StrafePreparedGesture *strafe_prepare_switch_gesture(StrafeDirection direction, double velocity);
+StrafePreparedGesture *strafe_prepare_ramp_gesture(StrafeDirection direction,
+    double peakProgress, double endVelocity, uint32_t steps, uint32_t delayMicroseconds);
+
+// Post the whole prepared gesture synchronously, with no further preparation.
+// The caller must serialize complete gestures, including mixed speed presets.
+// CGEventPost provides no acknowledgement that the Dock accepted a switch.
+// Free after posting, or free without posting to discard a prepared gesture.
+void strafe_post_prepared_gesture(StrafePreparedGesture *gesture);
+void strafe_free_prepared_gesture(StrafePreparedGesture *gesture);
+
+// Convenience: prepare, post and free one instant began -> changed -> ended
+// sequence. False means nothing was posted. `velocity` is a positive magnitude
+// (default 2000.0); macOS 27 uses its existing 0.1 / 9999 instant profile.
 bool strafe_post_switch_gesture(StrafeDirection direction, double velocity);
 
 // Post ONE phase of a horizontal dock swipe with an explicit progress and
-// velocity, to the same tap. Used only by the animated Transition speed
-// presets, which post a began -> ramped `changed` stream -> ended sequence
-// (SPEC §1.4); the instant preset uses the function above. Returns false only
-// if the event could not be created.
+// velocity. Retained for the standalone benchmark's custom shapes; the app
+// uses complete prepared gestures. Failure posts nothing for this phase, but
+// this API makes no guarantee about a sequence assembled by its caller.
 bool strafe_post_dock_swipe_phase(int64_t phase, double progress, double velocity);
 
 // --- Topology (SPEC §6) ---------------------------------------------------
@@ -109,6 +125,17 @@ uint64_t strafe_tap_event_mask(void);
 // --- Overlay / Exposé passthrough (SPEC §2.5) -----------------------------
 // True when App Exposé or Mission Control is up (Dock windows at layers 18/20).
 bool strafe_is_expose_active(void);
+
+typedef struct {
+    bool querySucceeded;
+    bool usesLoneLayer20Rule; // Retained for diagnostics; false since lone layer-20 is not sufficient.
+    uint32_t layer18Count;
+    uint32_t layer20Count;
+} StrafeOverlayDiagnostics;
+
+// The same decision, with optional counts from the single window query used
+// to make it. A failed query reports querySucceeded=false and zero counts.
+bool strafe_is_expose_active_with_diagnostics(StrafeOverlayDiagnostics *outDiagnostics);
 
 #ifdef __cplusplus
 }

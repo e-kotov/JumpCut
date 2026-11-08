@@ -9,15 +9,40 @@
 static CGEventRef postedEvents[6];
 static unsigned postedCount;
 static CFArrayRef overlayWindows;
+static unsigned overlayQueryCount;
 
 // Supply window metadata so overlay tests do not depend on the live desktop.
 CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption options, CGWindowID relativeToWindow) {
     assert(options == (kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements));
     assert(relativeToWindow == kCGNullWindowID);
+    overlayQueryCount++;
     return overlayWindows ? (CFArrayRef)CFRetain(overlayWindows) : NULL;
 }
 
-static void check_overlay(CFStringRef owner, const int *layers, size_t count, bool expected) {
+static void check_overlay_result(bool expected, bool querySucceeded,
+                                 uint32_t expectedLayer18, uint32_t expectedLayer20) {
+    overlayQueryCount = 0;
+    assert(strafe_is_expose_active() == expected);
+    assert(overlayQueryCount == 1);
+
+    // Start with stale values so both successful and unavailable queries must
+    // fill every field. Diagnostics must not trigger a second window query.
+    StrafeOverlayDiagnostics diagnostics = {
+        .querySucceeded = !querySucceeded,
+        .usesLoneLayer20Rule = true,
+        .layer18Count = UINT32_MAX,
+        .layer20Count = UINT32_MAX,
+    };
+    assert(strafe_is_expose_active_with_diagnostics(&diagnostics) == expected);
+    assert(overlayQueryCount == 2);
+    assert(diagnostics.querySucceeded == querySucceeded);
+    assert(!diagnostics.usesLoneLayer20Rule);
+    assert(diagnostics.layer18Count == expectedLayer18);
+    assert(diagnostics.layer20Count == expectedLayer20);
+}
+
+static void check_overlay(CFStringRef owner, const int *layers, size_t count, bool expected,
+                          uint32_t expectedLayer18, uint32_t expectedLayer20) {
     CFMutableArrayRef windows = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     assert(windows);
     for (size_t i = 0; i < count; i++) {
@@ -31,23 +56,23 @@ static void check_overlay(CFStringRef owner, const int *layers, size_t count, bo
         CFRelease(layer);
     }
     overlayWindows = windows;
-    assert(strafe_is_expose_active() == expected);
+    check_overlay_result(expected, true, expectedLayer18, expectedLayer20);
     overlayWindows = NULL;
     CFRelease(windows);
 }
 
 static void check_overlay_detection(void) {
-    assert(!strafe_is_expose_active()); // Window enumeration unavailable.
-    check_overlay(CFSTR("Dock"), NULL, 0, false);
-    check_overlay(CFSTR("Dock"), (int[]){18}, 1, false);
-    check_overlay(CFSTR("Dock"), (int[]){18, 18, 20}, 3, true);
-    check_overlay(CFSTR("Dock"), (int[]){18, 20, 20}, 3, true);
-    check_overlay(CFSTR("Finder"), (int[]){18, 20}, 2, false);
-    check_overlay(CFSTR("Finder"), (int[]){20}, 1, false);
-    check_overlay(CFSTR("Dock"), (int[]){0, 19, 21}, 3, false);
-    bool modern = false;
-    if (__builtin_available(macOS 27.0, *)) { modern = true; }
-    check_overlay(CFSTR("Dock"), (int[]){20}, 1, modern);
+    check_overlay_result(false, false, 0, 0); // Window enumeration unavailable.
+    check_overlay(CFSTR("Dock"), NULL, 0, false, 0, 0);
+    check_overlay(CFSTR("Dock"), (int[]){18}, 1, false, 1, 0);
+    check_overlay(CFSTR("Dock"), (int[]){18, 18, 20}, 3, true, 2, 1);
+    check_overlay(CFSTR("Dock"), (int[]){18, 20, 20}, 3, true, 1, 2);
+    check_overlay(CFSTR("Finder"), (int[]){18, 20}, 2, false, 0, 0);
+    check_overlay(CFSTR("Finder"), (int[]){20}, 1, false, 0, 0);
+    check_overlay(CFSTR("Dock"), (int[]){0, 19, 21}, 3, false, 0, 0);
+    // Reproduces the user's macOS 27.2 normal-desktop capture. A lone Dock
+    // layer-20 window must not suppress an otherwise valid Space swipe.
+    check_overlay(CFSTR("Dock"), (int[]){20}, 1, false, 0, 1);
 }
 
 // Override the framework entry point in this test executable. Exercise the

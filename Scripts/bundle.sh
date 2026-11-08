@@ -15,6 +15,7 @@ BUILD_DIR="$ROOT_DIR/build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
 YEAR="$(date +%Y)"
+SOURCE_REVISION="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 # Single source of truth for the version, shared with Scripts/release.sh. Read
 # it here rather than hardcoding, so a dev bundle and a signed release built
@@ -70,6 +71,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>$VERSION</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>JumpCutBuildCommit</key>
+    <string>$SOURCE_REVISION</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>LSUIElement</key>
